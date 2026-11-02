@@ -245,3 +245,9 @@ dist-ssr
 *.njsproj
 *.sln
 *.sw?
+
+# MAPK data
+data/raw/
+data/processed/
+*.zip
+*.tsv
