@@ -1,15 +1,51 @@
 # MAPK-Harness
 
-MAPK-Harness asks why KRAS G12D inhibitors work differently across patients and
-across cells in pancreatic cancer. It approaches this along two axes: a **genetic
-axis** comparing drug response across KRAS variants, and a **non-genetic axis**
-simulating how cell-to-cell differences in signaling protein abundance produce
-heterogeneous ERK suppression. A validation layer and an LLM agent harness sit on
-top of the modeling tools.
+MAPK-Harness studies two related questions: how the measured activity of a compound
+differs across KRAS variants, and how differences in signaling protein abundance
+could change simulated ERK suppression between cells carrying the same mutation.
+The project also evaluates the provenance, reproducibility, and failure handling
+of the tools used to explore these questions.
 
-This is an engineering project, not research. It reproduces published models and
-explores a hypothesis in simulation. The emphasis is on validation structure,
-reproducibility and failure detection rather than model accuracy.
+This is an engineering and simulation project. Biochemical potency, cellular pERK,
+and ODE output are different quantities; none alone establishes a patient's
+response. The emphasis is on explicit assumptions, comparison against baselines,
+and failure detection.
+
+## Current status and 30-day plan
+
+**Implemented:** BindingDB extraction and assay classification, mechanism-specific
+datasets, scaffold/patent split preparation, five-seed Random Forest baseline,
+and a G12D–WT exchange-assay selectivity table (120 shared molecules). The
+corresponding scripts are in `notebooks/`. The generated data and result CSVs
+under `data/processed/` are not committed; rerun the scripts with the source data
+to reproduce them.
+
+**Planned:** GCN evaluation on comparable splits; a verified Kholodenko-based
+ODE; an explicitly assumed potency-to-ODE input mapping; paired virtual-cell
+simulations and sensitivity analysis; provenance-aware prediction, simulation,
+and drug-likeness tools; and a budget-matched agent harness with fault injection.
+The current `backend/` modules are empty placeholders, and `frontend/` is an
+unmodified Vite starter, not a working simulator.
+
+The work is grouped into ten three-day cycles: study the relevant concepts,
+implement one slice, then verify and record the result.
+
+| Cycle | Deliverable |
+|---|---|
+| 01 | Define data flow, units, provenance, and the biochemical-to-cellular boundary |
+| 02 | Freeze the evaluation candidate pool and oracle using the existing selectivity table; check train/test overlap and lookup rules |
+| 03 | Train a GCN and compare it with RF on the same split and metrics |
+| 04 | Reproduce the reference MAPK ODE and check trajectories, units, and conservation |
+| 05 | Define and stress-test the assumed drug-effect mapping to ODE inputs |
+| 06 | Simulate paired untreated/treated virtual cells with varied protein abundance |
+| 07 | Calculate AUC-based responses and sensitivity under stated distribution assumptions |
+| 08 | Connect prediction, lookup, simulation, and drug-likeness tools with explicit error and provenance fields |
+| 09 | Compare equal-budget candidate search baselines and test fault detection |
+| 10 | Reproduce the pipeline, document limitations, and run a small H₂ or LiH VQE-to-classical energy comparison |
+
+The day-30 quantum calculation is a small, separate computational experiment. It
+does not predict KRAS binding, IC50, or cell response. It is included as an
+extension to the learning plan, not a dependency of the MAPK simulator or harness.
 
 ## The question
 
@@ -17,15 +53,14 @@ reproducibility and failure detection rather than model accuracy.
 > in ERK suppression comes from cell-to-cell differences in signaling protein
 > abundance, and which components contribute most?
 
-**Genetic axis** — The same compound inhibits different KRAS variants to different
-degrees. Selectivity between G12D and wild-type matters because wild-type KRAS is
-present in every cell, so hitting it causes toxicity.
+**Genetic axis** — The same compound can have different measured activity against
+different KRAS variants. G12D–WT selectivity is one assay-level comparison; it
+does not by itself quantify clinical toxicity.
 
 **Non-genetic axis** — Cells carrying the same mutation still respond differently.
-In the MAPK pathway the dominant source is extrinsic variability — differences in
-how much of each signaling protein a cell happens to have — rather than intrinsic
-stochastic noise, since MAPK proteins are abundant enough that molecular-level
-fluctuation averages out.
+This project varies protein abundance across simulated cells to examine one
+possible extrinsic source of heterogeneity. It does not assume that this source
+dominates every KRAS G12D cell line or treatment condition.
 
 Two papers ground this framing:
 - Filippi et al., *Cell Reports* (2016), PMID 27264188 — in MEK-ERK, the dominant
@@ -38,11 +73,11 @@ Both carry conditions. Neither claims to explain drug response in KRAS G12D canc
 in full, and the second uses a model with ERK–nuclear-pore regulation that the
 simplified Kholodenko model here does not include.
 
-## Architecture
+## Planned architecture
 
 ```
 Tools
-  molbind (GCN)        SMILES              → pIC50
+  molecular model      SMILES + variant     → assay-level pIC50 estimate
   MAPK ODE             inhibition          → ERK-PP trajectory
   cell population      protein abundances  → response distribution
   sensitivity          simulation output   → contribution ranking
@@ -54,29 +89,31 @@ Validation
   fault injection        5 fault classes, measured detection rate
 
 Harness
-  ReAct loop over three tools
+  ReAct loop over three proposed tools
   task: find compounds that inhibit G12D while sparing wild-type
   baselines: random / potency ranking / budget-matched search / ReAct
 ```
 
-The ODE is a reduced Kholodenko (2000) cascade — RAF\*, MEK-P, MEK-PP, ERK-P,
-ERK-PP with negative feedback — rather than the full Huang-Ferrell model, which has
-15 species and 37 parameters. Active KRAS-GTP enters only as a coefficient on the
-RAF activation rate.
+The planned ODE uses a reduced Kholodenko (2000) cascade. Its species, parameters,
+feedback, and KRAS-to-RAF input mapping still need to be implemented and checked
+against a reference before biological interpretation.
 
-### Tool contract
+### Proposed tool contract
 
 ```
 predict_pic50(smiles, variant) -> {
   pic50: float | null,
   source: "gcn" | "rf" | "lookup",
+  assay_endpoint: string | null,
+  model_or_data_version: string | null,
   in_domain: bool,
   error: string | null
 }
 
-simulate_population(pic50, dose_nM, n_cells) -> {
+simulate_population(pic50, dose_nM, n_cells, seed) -> {
   response_rate: float,
   auc_reduction: {mean, std, p10, p90},
+  mapping_assumptions: object,
   converged: bool,
   error: string | null
 }
@@ -84,8 +121,9 @@ simulate_population(pic50, dose_nM, n_cells) -> {
 check_druglike(smiles) -> {mw, logp, qed, passes, error}
 ```
 
-Every tool returns errors as values rather than raising. Fault-injection testing
-depends on this.
+The intended interface distinguishes measured lookup values, model predictions,
+and assumption-based simulation outputs. Errors are returned explicitly so the
+harness can test failure handling.
 
 ## Data
 
@@ -136,8 +174,9 @@ in the dataset of why the validation layer exists: the label alone is not reliab
 | biochem (exchange + binding) | 652 | 233 | 13 | 8.47 |
 | mixed | 2,102 | 594 | 21 | 7.57 |
 
-All three are trained and compared. If the pooled model does not beat the separated
-ones, mechanism separation is demonstrated rather than asserted.
+The RF baseline has been run on all three datasets. GCN comparison on matched
+splits is planned. Pooling assay mechanisms remains an experimental comparison,
+not evidence that they are interchangeable.
 
 ### Selectivity dataset
 
@@ -155,7 +194,7 @@ selectivity = pIC50(G12D) − pIC50(WT)
 range −1.55 to 2.42, median 1.43, sd 0.76, 13 negative
 ```
 
-Potency and selectivity are independent here: their correlation is **0.041**, and
+Potency and selectivity have a near-zero correlation in this table (**0.041**), and
 the top five by each measure share **no molecules**. Ranking by potency alone does
 not solve the task.
 
@@ -202,8 +241,10 @@ In progress.
   the direct motivation for applicability-domain checks in the harness.
 - **No experimental validation.** The cell population model is mechanistic and
   unvalidated. It is a hypothesis explored in simulation.
-- **Ground truth is internal.** The harness scores an agent against exhaustive search
-  using the same tools. It measures tool use under a call budget, not real efficacy.
+- **Evaluation target.** The candidate-pool oracle and train/test separation are
+  still to be fixed. A tool-derived exhaustive ranking measures tool use under a
+  call budget, not drug efficacy; a held-out measured oracle answers a different
+  question and must be labeled separately.
 - **No literature anchor.** MRTX1133 and other reference inhibitors come from ChEMBL
   and are absent here. Acquiring them separately is pending.
 - **Mechanism coverage.** Selectivity rests on 120 exchange-assay molecules;
